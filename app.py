@@ -9,7 +9,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
-from google import gemini
+from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
