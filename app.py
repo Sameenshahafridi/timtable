@@ -9,9 +9,31 @@ from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
-from google import genai
-from google.genai import types
-from pydantic import BaseModel
+
+try:
+    from google import genai
+    from google.genai import types
+    from pydantic import BaseModel
+except ImportError as _import_err:  # show the REAL cause (Streamlit Cloud redacts it)
+    import sys
+    from importlib import metadata
+
+    st.error(f"Import failed: {_import_err!r}")
+    st.write("Python version:", sys.version)
+    st.write(
+        "Installed packages related to google/genai/pydantic:",
+        sorted(
+            f"{d.metadata['Name']}=={d.version}"
+            for d in metadata.distributions()
+            if d.metadata["Name"]
+            and any(k in d.metadata["Name"].lower() for k in ("google", "genai", "pydantic"))
+        ),
+    )
+    st.info(
+        "Make sure requirements.txt is in the repo root (same folder as app.py) and "
+        "contains: google-genai, pydantic, pandas, streamlit. Then reboot the app."
+    )
+    st.stop()
 
 # "gemini-flash-latest" always points to the newest Flash model.
 # Override with the GEMINI_MODEL secret/env var (e.g. "gemini-2.5-flash").
