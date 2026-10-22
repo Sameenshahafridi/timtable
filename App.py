@@ -7,19 +7,54 @@ import os
 import re
 from datetime import date, timedelta
 
+import importlib
+import subprocess
+import sys
+
 import pandas as pd
 import streamlit as st
+
+
+def _ensure_packages():
+    """Safety net: if Streamlit Cloud did not install requirements.txt,
+    try to install the needed packages at start-up."""
+    try:
+        importlib.import_module("google.genai")
+        importlib.import_module("pydantic")
+        return
+    except ImportError:
+        pass
+    pkgs = ["google-genai", "pydantic"]
+    commands = [
+        [sys.executable, "-m", "pip", "install", "--quiet", *pkgs],
+        ["uv", "pip", "install", "--quiet", "--python", sys.executable, *pkgs],
+    ]
+    for cmd in commands:
+        try:
+            subprocess.check_call(cmd, timeout=300)
+            importlib.invalidate_caches()
+            importlib.import_module("google.genai")
+            return
+        except Exception:
+            continue
+
+
+_ensure_packages()
 
 try:
     from google import genai
     from google.genai import types
     from pydantic import BaseModel
 except ImportError as _import_err:  # show the REAL cause (Streamlit Cloud redacts it)
-    import sys
+    import os
     from importlib import metadata
 
     st.error(f"Import failed: {_import_err!r}")
     st.write("Python version:", sys.version)
+    here = os.path.dirname(os.path.abspath(__file__))
+    st.write("Files next to app.py:", sorted(os.listdir(here)))
+    st.write("Repo root files:", sorted(os.listdir(os.path.dirname(here)))[:30]
+             if os.path.basename(here) not in ("timtable",) else "(app.py is in repo root)")
     st.write(
         "Installed packages related to google/genai/pydantic:",
         sorted(
@@ -28,10 +63,6 @@ except ImportError as _import_err:  # show the REAL cause (Streamlit Cloud redac
             if d.metadata["Name"]
             and any(k in d.metadata["Name"].lower() for k in ("google", "genai", "pydantic"))
         ),
-    )
-    st.info(
-        "Make sure requirements.txt is in the repo root (same folder as app.py) and "
-        "contains: google-genai, pydantic, pandas, streamlit. Then reboot the app."
     )
     st.stop()
 
