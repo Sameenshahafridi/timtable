@@ -42,10 +42,27 @@ Free API key: https://aistudio.google.com/apikey
 | Setting | Where | Default |
 |---|---|---|
 | `GEMINI_API_KEY` | secrets / env / sidebar | - |
-| `GEMINI_MODEL` | secrets / env | tries `gemini-flash-latest`, then `gemini-2.5-flash` |
+| `GEMINI_MODEL` | secrets / env | tries `gemini-flash-latest`, `gemini-2.5-flash`, `gemini-flash-lite-latest`, `gemini-2.5-flash-lite` in order |
+
+## Free-tier quota (429 errors)
+The free Gemini API allows only a small number of requests per day for each
+model (for example 20). The app:
+- skips to the next model as soon as one model's daily quota is used up,
+- remembers plans for 24 hours, so the same request does not use quota twice,
+- shows a basic template timetable (clearly labelled) if every model is out of quota.
+
+To get more quota: wait for the daily reset, paste a different API key in the
+sidebar (a key from a new Google project has its own quota), or enable billing
+in Google AI Studio. A key typed in the sidebar takes priority over Secrets.
+
+## Handling Gemini "high demand" (503) errors
+Google's servers are sometimes overloaded. The app retries, switches to other
+Flash models automatically, and if all are busy it shows a basic template
+timetable (clearly labelled) so you always get a plan. Click **Generate** again
+a minute later for a personalised AI plan.
 
 ## Troubleshooting
 - **"API key not valid"** -> create a new key at aistudio.google.com/apikey.
-- **429 / quota error** -> wait a minute (free tier limits) and try again.
-- **Model not found** -> set `GEMINI_MODEL = "gemini-2.5-flash"` in Secrets.
+- **Template plan shown** -> Gemini was busy or your free quota is used up; the notice says which. Try again later or use another API key.
+- **Want one fixed model** -> set `GEMINI_MODEL = "gemini-2.5-flash"` in Secrets.
 - Never commit your API key to GitHub.
