@@ -19,7 +19,13 @@ import streamlit as st
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 # Tried in order. Override with the GEMINI_MODEL secret / environment variable.
-DEFAULT_MODELS = ["gemini-flash-latest", "gemini-2.5-flash"]
+DEFAULT_MODELS = [
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite",
+]
+RETRYABLE = (500, 502, 503, 504)  # temporary Google-side problems (429 handled separately)
 
 # JSON structure we ask Gemini to return
 PLAN_SCHEMA = {
@@ -43,6 +49,15 @@ PLAN_SCHEMA = {
     },
     "required": ["overview", "sessions", "tips"],
 }
+
+
+class ServiceBusy(RuntimeError):
+    """Every model was overloaded, out of quota or unavailable (temporary problem).
+    quota=True means the failures were all free-tier quota (429) errors."""
+
+    def __init__(self, message, quota=False):
+        super().__init__(message)
+        self.quota = quota
 
 
 class GeminiError(Exception):
@@ -145,24 +160,92 @@ def parse_plan(text):
     return {"overview": str(data.get("overview", "")), "sessions": sessions, "tips": tips}
 
 
+def _is_daily_quota(msg):
+    """True when a 429 says the DAILY free quota is gone (waiting a few seconds won't help)."""
+    m = msg.lower()
+    return "per day" in m or "perday" in m.replace(" ", "") or bool(re.search(r"retry in \d+h", m))
+
+
 def generate_plan(api_key, models, prompt):
-    """Try each model; retry once on temporary errors / bad JSON."""
+    """Try each model in turn.
+    - 429 daily quota  -> skip straight to the next model (each model has its own quota)
+    - 429 per-minute   -> wait briefly, retry once, then next model
+    - 503/500/...      -> wait, retry once, then next model
+    - 404 / bad JSON / network blip -> retry once, then next model
+    Raises ServiceBusy if every model failed temporarily, or GeminiError for
+    permanent problems such as an invalid API key."""
     last_err = None
-    for model in models:
+    saw_quota = False
+    saw_other = False
+    for i, model in enumerate(models):
         for attempt in range(2):
             try:
                 return parse_plan(call_gemini(api_key, model, prompt))
             except GeminiError as e:
                 last_err = e
-                if e.code == 404:                      # model name not available
-                    break                              # -> try next model
-                if e.code in (429, 500, 503) and attempt == 0:
-                    time.sleep(2)
+                if e.code == 429:
+                    saw_quota = True
+                    if _is_daily_quota(str(e)) or attempt == 1:
+                        break                          # -> next model
+                    time.sleep(3)
                     continue
-                raise                                  # bad key, blocked, network...
+                if e.code == 404:
+                    break                              # model not available -> next
+                saw_other = True
+                if e.code is None or e.code in RETRYABLE:
+                    if attempt == 0:
+                        time.sleep(2 + 2 * i)          # simple back-off
+                        continue
+                    break                              # -> next model
+                raise                                  # invalid key, bad request...
             except (ValueError, json.JSONDecodeError) as e:
-                last_err = e                           # bad JSON -> retry once
-    raise RuntimeError(f"Could not generate a plan: {last_err}")
+                last_err = e                           # bad JSON -> retry / next model
+                saw_other = True
+    raise ServiceBusy(f"Gemini is unavailable right now ({last_err}).",
+                      quota=saw_quota and not saw_other)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False, max_entries=200)
+def cached_generate_plan(api_key, models, prompt):
+    """Same request within 24h = no new Gemini call (saves your free quota).
+    Errors are never cached."""
+    return generate_plan(api_key, list(models), prompt)
+
+
+def build_fallback_plan(book, days, hours_per_day):
+    """Simple built-in timetable used only when Gemini is unavailable."""
+    budget = int(round(hours_per_day * 60))
+    read_m, note_m = int(budget * 0.6), int(budget * 0.25)
+    recap_m = budget - read_m - note_m
+    sessions = []
+    if days == 1:
+        sessions = [
+            {"day": 1, "topic": "Survey the book", "activities": "Read the contents page, introduction and chapter headings.", "duration_minutes": recap_m},
+            {"day": 1, "topic": "Core reading", "activities": "Read the main chapters actively and mark key ideas.", "duration_minutes": read_m},
+            {"day": 1, "topic": "Summary and self-test", "activities": "Write a one-page summary and quiz yourself.", "duration_minutes": note_m},
+        ]
+    else:
+        n = days - 1                                    # reading days; last day = revision
+        for i in range(1, n + 1):
+            lo, hi = round((i - 1) * 100 / n), round(i * 100 / n)
+            part = f"Part {i} of {n} (about {lo}%-{hi}% of the book)"
+            sessions += [
+                {"day": i, "topic": part, "activities": "Read actively; mark key ideas and questions." + (" Start by skimming the contents page." if i == 1 else ""), "duration_minutes": read_m},
+                {"day": i, "topic": part + " - notes", "activities": "Write a short summary in your own words and list key terms.", "duration_minutes": note_m},
+                {"day": i, "topic": "Quick recap", "activities": "Quiz yourself on today's part without looking at your notes.", "duration_minutes": recap_m},
+            ]
+        sessions += [
+            {"day": days, "topic": "Revision of all parts", "activities": "Review your notes and re-read the most important sections.", "duration_minutes": int(budget * 0.5)},
+            {"day": days, "topic": "Self-test", "activities": "Answer questions on the key ideas from memory.", "duration_minutes": int(budget * 0.35)},
+            {"day": days, "topic": "Next steps", "activities": "List what to review again and how to apply what you learned.", "duration_minutes": budget - int(budget * 0.5) - int(budget * 0.35)},
+        ]
+    return {
+        "overview": f"Basic template plan for \"{book}\" (Gemini was busy, so this plan is generic and not based on the book's real chapters).",
+        "sessions": sessions,
+        "tips": ["Study in focused blocks and take short breaks.",
+                 "Test yourself instead of only re-reading.",
+                 "Click Generate again later to get a Gemini-made plan."],
+    }
 
 
 def plan_to_dataframe(plan, start, days, hours_per_day):
@@ -220,8 +303,8 @@ def _secret(name):
 
 
 def get_api_key(sidebar_value):
-    """Priority: Streamlit secrets -> environment variable -> sidebar input."""
-    return _secret("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or sidebar_value or None
+    """Priority: key typed in the sidebar -> Streamlit secrets -> environment variable."""
+    return (sidebar_value or "").strip() or _secret("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or None
 
 
 def get_models():
@@ -243,7 +326,8 @@ def main():
             "Gemini API key",
             type="password",
             help="Get a free key at https://aistudio.google.com/apikey. "
-                 "Not needed if it is set in Streamlit secrets.",
+                 "Optional if a key is set in Streamlit secrets; a key typed here takes priority. "
+                 "Free keys have a small daily limit - a new key from a new Google project resets it.",
         )
         st.caption("Model: " + " -> ".join(get_models()))
 
@@ -274,10 +358,25 @@ def main():
             st.error("Please provide a Gemini API key (sidebar or Streamlit secrets).")
         else:
             prompt = build_prompt(book.strip(), goal, level, int(days), float(hours), notes.strip())
-            with st.spinner("Building your timetable..."):
+            with st.spinner("Building your timetable (this can take up to a minute if Gemini is busy)..."):
                 try:
-                    plan = generate_plan(api_key, get_models(), prompt)
+                    notice = None
+                    try:
+                        plan = cached_generate_plan(api_key, tuple(get_models()), prompt)
+                    except ServiceBusy as busy:
+                        plan = build_fallback_plan(book.strip(), int(days), float(hours))
+                        if busy.quota:
+                            notice = ("Your free Gemini quota is used up for now (the free tier allows "
+                                      "only a few requests per day per model), so a basic template "
+                                      "timetable is shown. Try again later, or paste a different API "
+                                      "key in the sidebar.")
+                        else:
+                            notice = ("Google's Gemini servers are overloaded right now, so a basic "
+                                      "template timetable is shown. Click Generate again in a minute "
+                                      "for a personalised AI plan.")
                     df, warnings = plan_to_dataframe(plan, start, int(days), float(hours))
+                    if notice:
+                        warnings.insert(0, notice)
                     st.session_state["result"] = {
                         "book": book.strip(), "plan": plan, "df": df, "warnings": warnings,
                     }
